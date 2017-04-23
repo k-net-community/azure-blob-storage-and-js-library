@@ -1,0 +1,258 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title></title>
+    <link rel="stylesheet" href="https://cdn.bootcss.com/bootstrap/3.3.0/css/bootstrap.min.css">
+    <script src="JS/azure-storage.common.js"></script>
+    <script src="JS/azure-storage.blob.js"></script>
+
+    <script>
+         //Provides a Stream for a file in webpage, inheriting from NodeJS Readable stream.
+        var Stream = require('stream');
+        var util = require('util');
+        var Buffer = require('buffer').Buffer;
+
+        function FileStream(file, opt) {
+            Stream.Readable.call(this, opt);
+
+            this.fileReader = new FileReader(file);
+            this.file = file;
+            this.size = file.size;
+            this.chunkSize = 1024 * 1024 * 4; // 4MB
+            this.offset = 0;
+            var _me = this;
+
+            this.fileReader.onloadend = function loaded(event) {
+                var data = event.target.result;
+                var buf = Buffer.from(data);
+                _me.push(buf);
+            }
+        }
+        util.inherits(FileStream, Stream.Readable);
+        FileStream.prototype._read = function () {
+            if (this.offset > this.size) {
+                this.push(null);
+            } else {
+                var end = this.offset + this.chunkSize;
+                var slice = this.file.slice(this.offset, end);
+                this.fileReader.readAsArrayBuffer(slice);
+                this.offset = end;
+            }
+        };
+    </script>
+
+</head>
+<body>
+    <div class="container">
+        <div class="mt-1">
+            <h1>Azure Storage JavaScript Client Library Sample Demo</h1>
+        </div>
+        <div>
+            <p>
+                <label><b>Storage Account:</b> </label> <input type="text" id="account" />
+                <label><b>Token:</b> </label> <input type="text" id="sastoken" />
+            </p>
+        </div>
+        <hr />
+        <div>
+            <div>
+                <button class="btn btn-primary" onclick="refreshBlobList()">ListBlobs</button>
+                <p></p>
+            </div>
+
+            <div>
+                <table>
+                    <tr>
+                        <td><button id="upload-button" class="btn btn-primary" onclick="uploadBlobByStream(0)">UploadBlob</button></td>
+                        <td><input type="file" id="files" name="file" onclick="displayProcess(0)" /></td>
+                    </tr>
+                </table>
+
+                <div>
+                    Uploaded Bytes: <font id="read"> </font>
+                </div>
+                <div class="progress">
+                    <div id="progress" class="progress-bar" role="progressbar" aria-valuenow="60" aria-valuemin="0" aria-valuemax="100" style="width: 0%;">
+                        0%
+                    </div>
+                </div>
+                <div id="bloblistresult"></div>
+            </div>
+        </div>
+
+        <!-- Azure Storage JavaScript Client Library -->
+
+        <script>
+            var account = document.getElementById('account').value;
+            var sastoken = document.getElementById('sastoken').value;
+            
+            var container = 'userfiles'; //your container name
+            var blobUri = '';
+
+            function getBlobService() {
+                if (!checkParameters())
+                    return null;
+                blobUri = 'https://' + account + '.blob.core.windows.net';
+                var blobService = AzureStorage.createBlobServiceWithSas(blobUri, sastoken).withFilter(new AzureStorage.ExponentialRetryPolicyFilter());
+
+                return blobService;
+            }
+           
+            function refreshBlobList() {
+                var blobService = getBlobService();
+                if (!blobService)
+                    return;
+                document.getElementById('bloblistresult').innerHTML = 'Loading...';
+                blobService.createContainerIfNotExists(container,
+                    function (error, result) {
+                        if (error) {
+                            alert('createContainerIfNotExists error, please open browser console to view detailed error');
+                            console.log(error);
+                        } else {
+                            blobService.listBlobsSegmented(container,
+                                null,
+                                function (error, results) {
+                                    if (error) {
+                                        alert('List blob error, please open browser console to view detailed error');
+                                        console.log(error);
+                                    } else {
+                                        var output = [];
+                                        output.push('<tr>',
+                                            '<th>BlobName</th>',
+                                            '<th>ContentLength</th>',
+                                            '<th>LastModified</th>',
+                                            '<th>Operations</th>',
+                                            '</tr>');
+                                        if (results.entries.length < 1) {
+                                            output.push('<tr><td>Empty results...</td></tr>');
+                                        }
+                                        for (var i = 0, blob; blob = results.entries[i]; i++) {
+                                            output.push('<tr>',
+                                                '<td>',
+                                                blob.name,
+                                                '</td>',
+                                                '<td>',
+                                                blob.contentLength,
+                                                '</td>',
+                                                '<td>',
+                                                blob.lastModified,
+                                                '</td>',
+                                                '<td>',
+                                                '<button class="btn btn-xs btn-danger" onclick="deleteBlob(\'',
+                                                blob.name,
+                                                '\')">Delete</button> ',
+                                                '<a class="btn btn-xs btn-success" href="',
+                                                blobUri + '/' + container + '/' + blob.name,
+                                                '" download>Download</a>',
+                                                '</td>',
+                                                '</td>',
+                                                '</tr>');
+                                        }
+                                        document.getElementById('bloblistresult')
+                                            .innerHTML = '<table class="table table-condensed table-bordered">' +
+                                            output.join('') +
+                                            '</table>';
+                                    }
+                                });
+                        }
+                    });
+            }
+
+            function uploadBlobByStream(checkMD5) {
+                var files = document.getElementById('files').files;
+                if (!files.length) {
+                    alert('Please select a file!');
+                    return;
+                }
+                var file = files[0];
+
+                var blobService = getBlobService();
+                if (!blobService)
+                    return;
+
+                var btn = document.getElementById("upload-button");
+                btn.disabled = true;
+                btn.innerHTML = "Uploading";
+
+                var fileStream = new FileStream(file);
+
+                // Make a smaller block size when uploading small blobs
+                var blockSize = file.size > 1024 * 1024 * 32 ? 1024 * 1024 * 4 : 1024 * 512;
+                var options = {
+                    storeBlobContentMD5: checkMD5,
+                    blockSize: blockSize
+                };
+                blobService.singleBlobPutThresholdInBytes = blockSize;
+
+                var finishedOrError = false;
+                var speedSummary = blobService.createBlockBlobFromStream(container, file.name, fileStream, file.size, options, function (error, result, response) {
+                    finishedOrError = true;
+                    btn.disabled = false;
+                    btn.innerHTML = "UploadBlob";
+                    
+                    if (error) {
+                        alert('Upload filed, open brower console for more detailed info.');
+                        console.log(error);
+                        displayProcess(0);
+                    } else {
+                        displayProcess(100);
+                        setTimeout(function () { // Prevent alert from stopping UI progress update
+                            alert('Upload successfully!');
+                        }, 1000);
+                        refreshBlobList();
+                    }
+                });
+                function refreshProgress() {
+                    setTimeout(function () {
+                        if (!finishedOrError) {
+                            var process = speedSummary.getCompletePercent();
+                            displayProcess(process);
+                            refreshProgress();
+                        }
+                    }, 200);
+                }
+                refreshProgress();
+            }
+
+            function deleteBlob(blob) {
+                var blobService = getBlobService();
+                if (!blobService)
+                    return;
+
+                blobService.deleteBlobIfExists(container, blob, function (error, result) {
+                    if (error) {
+                        alert('Delete blob failed, open brower console for more detailed info.');
+                        console.log(error);
+                    } else {
+                        alert('Delete ' + blob + ' successfully!');
+                        refreshBlobList();
+                    }
+                });
+            }
+
+            function displayProcess(process) {
+                document.getElementById("progress").style.width = process + '%';
+                document.getElementById("progress").innerHTML = process + '%';
+            }
+
+            function checkParameters() {
+                account = document.getElementById('account').value;
+                sastoken = document.getElementById('sastoken').value;
+
+                if (account == null || account.length < 1) {
+                    alert('Please enter a valid storage account name!');
+                    return false;
+                }
+                if (sastoken == null || sastoken.length < 1) {
+                    alert('Please enter a valid SAS Token!');
+                    return false;
+                }
+
+                return true;
+            }
+
+        </script>
+    </div>
+</body>
+</html>
